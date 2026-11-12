@@ -18,6 +18,10 @@
     {
       "workflow_id": "render-mixdown",
       "command": "go run ./cmd/timelinecheck -workflow render-mixdown"
+    },
+    {
+      "workflow_id": "disconnect-reconciliation",
+      "command": "go run ./cmd/timelinecheck -workflow disconnect-reconciliation"
     }
   ]
 }

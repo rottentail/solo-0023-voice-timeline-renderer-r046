@@ -14,6 +14,10 @@ import (
 )
 
 func Run(ctx context.Context, workflow string) error {
+	if workflow == "disconnect-reconciliation" {
+		return RunDisconnectReconciliation(ctx)
+	}
+
 	harness, err := NewHarness()
 	if err != nil {
 		return err

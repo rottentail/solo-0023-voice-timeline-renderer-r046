@@ -176,7 +176,11 @@ internal/domain/        entities, validation, errors, and render transitions
 internal/audiocodec/    WAV handling, transforms, and signal measurement
 internal/render/        timeline preparation, mixing, normalization, receipt
 internal/storage/       atomic local repository
-internal/checkflow/     bounded production workflow checks
+internal/checkflow/     bounded production workflow checks and disconnect reconciliation
+  faultproxy.go         byte- and commit-anchored TCP connection fault injector
+  instrumented_repo.go  test-only repository decorator emitting commit-boundary signals
+  disconnect*.go        three-view reconciliation, disk facts, and replayable evidence
+  *_test.go             unit tests for the proxy, decorator, and reconciliation
 ```
 
 ## Workflow checks
@@ -187,16 +191,67 @@ Run each declared production check from the repository root:
 go run ./cmd/timelinecheck -workflow ingest-audio-source
 go run ./cmd/timelinecheck -workflow compose-timeline
 go run ./cmd/timelinecheck -workflow render-mixdown
+go run ./cmd/timelinecheck -workflow disconnect-reconciliation
 ```
 
 Each check creates an isolated temporary data directory, starts the real HTTP
 handler, sends generated WAV inputs, and verifies read-back or rendered output.
 The checks are bounded and do not require network access.
 
-## Deferred test boundary
+## Connection interruption reconciliation
 
-This baseline contains no unit tests, test fixtures, browser checks, or
-`test_command`. The downstream task stage owns test creation and red/green
-verification. It should extend coverage around WAV chunk edge cases, timeline
-crossfade bounds, failed job cleanup, concurrent idempotency, and HTTP error
-mapping.
+The three classic workflow checks wait for a complete HTTP response, so they
+cannot say what happens when the client receives only a partial response or no
+response at all. `disconnect-reconciliation` closes that gap with a real
+fault-injecting TCP relay (`internal/checkflow/faultproxy.go`) placed in front
+of the unmodified HTTP service:
+
+- **Request truncation** is anchored to relayed byte counts, so the service
+  observes a genuinely truncated upload.
+- **Response cuts** are armed by deterministic storage-commit boundary signals
+  emitted by a test-only repository decorator
+  (`internal/checkflow/instrumented_repo.go`): the cut fires only after the
+  source folder or render artifacts have been atomically renamed into place (or
+  after the durable queued job is written). No wall-clock sleep is used; the
+  harness waits on proxy stream and upstream-EOF events.
+
+For every interrupted write of a source or a render, the check reconciles
+three independent views against the on-disk facts:
+
+1. the writing client's record (transport error or partial response — a
+   disconnection is never pre-classified as a business failure),
+2. a retry with the same identifier over a clean connection, whose expected
+   status (`201` created vs. `200` idempotent replay) is derived from the disk
+   state rather than chosen by the test,
+3. a separate reader client that never saw the interrupted connection.
+
+A failure leaves a replayable evidence directory containing the minimum network
+event log and disk layout needed to explain the uncertain outcome; the data
+directory is retained and its path is printed.
+
+### Known counter-example (render cut after the queued job)
+
+Cutting the connection at the durable `queued` boundary exposes a current
+limitation: the render pipeline observes request-context cancellation
+(`internal/render/mixer.go`) and the service records it as a terminal
+`render_failed` job. Because `completed` and `failed` are terminal, a same-ID
+retry then returns the poisoned failed job forever instead of completing. The
+counter-example is preserved by
+`TestDisconnectReconciliationQueuedCutFailure` and must keep producing
+replayable evidence until the service stops treating client disconnection as a
+business failure. The other six interruption windows reconcile cleanly.
+
+## Test boundary
+
+Focused Go tests now cover the fault-injecting proxy, the commit-boundary
+repository decorator, and the connection-interruption reconciliation
+(`internal/checkflow/*_test.go`). Run them with:
+
+```bash
+go test ./...
+```
+
+Further coverage can extend around WAV chunk edge cases, timeline crossfade
+bounds, failed job cleanup, and HTTP error mapping. The reconciliation tests
+own the success-promise question under real socket interruption, including the
+retained render-queued counter-example described above.
